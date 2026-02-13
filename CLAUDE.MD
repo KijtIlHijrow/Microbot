@@ -5,7 +5,10 @@ Short notes for writing automation scripts with the Microbot plugin inside RuneL
 ## Paths & Builds
 - Plugin sources live in `runelite-client/src/main/java/net/runelite/client/plugins/microbot`.
 - The queryable API lives in `.../microbot/api`; full guide: `.../microbot/api/QUERYABLE_API.md`.
-- Quick builds: `mvn -pl runelite-client -am package`; tests: `mvn -pl runelite-client test`.
+- Build system is **Gradle** (not Maven). The client module is `:client`.
+- Quick compile: `gradlew :client:compileJava`; full build: `gradlew :client:build -x test`; run: `gradlew :client:run`.
+- Old source files and decompiled classes live in `temp-flipper/` for reference only.
+- **Bolt launcher**: The user runs the client via `C:\Users\keith\Downloads\Bolt\bolt.exe`. Bolt's config at `C:\Users\keith\AppData\Roaming\bolt-launcher\config\launcher.json` has a `runelite_custom_jar` field pointing to a specific jar in `runelite-client/build/libs/`. After every build that bumps the version, update the jar filename in that JSON so Bolt picks up the new version (e.g. `microbot-2.1.18.jar` → `microbot-2.1.19.jar`).
 
 ## Queryable API Quick Reference
 Prefer the queryable API over legacy util calls.
