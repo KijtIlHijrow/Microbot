@@ -10,6 +10,11 @@ Short notes for writing automation scripts with the Microbot plugin inside RuneL
 - Old source files and decompiled classes live in `temp-flipper/` for reference only.
 - **Bolt launcher**: The user runs the client via `C:\Users\keith\Downloads\Bolt\bolt.exe`. Bolt's config at `C:\Users\keith\AppData\Roaming\bolt-launcher\config\launcher.json` has a `runelite_custom_jar` field pointing to a specific jar in `runelite-client/build/libs/`. After every build that bumps the version, update the jar filename in that JSON so Bolt picks up the new version (e.g. `microbot-2.1.18.jar` → `microbot-2.1.19.jar`).
 
+## Plugin Versioning
+- **Every time a plugin is modified, bump its patch version** (e.g. `v1.1.0` → `v1.1.1` → `v1.1.2`).
+- The version string is typically in the plugin's overlay or panel class (e.g. `"Flipper v1.1.0"`). Update it with each change so the user can confirm they're running the latest.
+- Minor feature additions bump the minor version; bug fixes and tweaks bump the patch version.
+
 ## Queryable API Quick Reference
 Prefer the queryable API over legacy util calls.
 

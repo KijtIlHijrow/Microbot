@@ -29,8 +29,10 @@ import net.runelite.api.Point;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.worldmap.WorldMap;
@@ -133,6 +135,14 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
     private ETAOverlayPanel etaOverlayPanel;
 
     @Inject
+    private WalkingStatusOverlay walkingStatusOverlay;
+
+    @Getter
+    private static RouteConfirmationOverlay confirmOverlay;
+    @Inject
+    private RouteConfirmationOverlay confirmOverlayInstance;
+
+    @Inject
     private SpriteManager spriteManager;
 
     @Inject
@@ -185,12 +195,14 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
     @Getter
     public static PathfinderConfig pathfinderConfig;
     @Getter
+    public static volatile RouteConfirmation routeConfirmation;
+    @Getter
     @Setter
     public static boolean startPointSet = false;
     @Setter
     private static int reachedDistance;
-    @Getter(AccessLevel.PACKAGE)
-    private ShortestPathScript shortestPathScript;
+    @Getter
+    private static ShortestPathScript shortestPathScript;
     @Provides
     public ShortestPathConfig provideConfig(ConfigManager configManager) {
         return configManager.getConfig(ShortestPathConfig.class);
@@ -226,6 +238,8 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
         clientToolbar.addNavigation(pohNavButton);
 
         Rs2Walker.setConfig(config);
+        confirmOverlay = confirmOverlayInstance;
+        routeConfirmation = new RouteConfirmation();
         shortestPathScript = new ShortestPathScript();
         shortestPathScript.run(config);
 
@@ -237,6 +251,9 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
             overlayManager.add(etaOverlayPanel);
         }
 
+        overlayManager.add(confirmOverlayInstance);
+        overlayManager.add(walkingStatusOverlay);
+
         if (config.drawDebugPanel()) {
             overlayManager.add(debugOverlayPanel);
         }
@@ -245,11 +262,18 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
 
     @Override
     protected void shutDown() {
+        if (routeConfirmation != null) {
+            routeConfirmation.reset();
+        }
+        routeConfirmation = null;
+        overlayManager.remove(confirmOverlayInstance);
+        confirmOverlay = null;
         overlayManager.remove(pathOverlay);
         overlayManager.remove(pathMinimapOverlay);
         overlayManager.remove(pathMapOverlay);
         overlayManager.remove(pathMapTooltipOverlay);
         overlayManager.remove(debugOverlayPanel);
+        overlayManager.remove(walkingStatusOverlay);
         clientToolbar.removeNavigation(navButton);
         clientToolbar.removeNavigation(pohNavButton);
         navButton = null;
@@ -361,9 +385,26 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
 
         // Transport option changed; rerun pathfinding
         if (TRANSPORT_OPTIONS_REGEX.matcher(event.getKey()).find()) {
+            if (pathfinderConfig != null) {
+                pathfinderConfig.markDirty();
+            }
             if (pathfinder != null) {
                 restartPathfinding(pathfinder.getStart(), pathfinder.getTargets());
             }
+        }
+    }
+
+    @Subscribe
+    public void onItemContainerChanged(ItemContainerChanged event) {
+        if (pathfinderConfig != null) {
+            pathfinderConfig.markDirty();
+        }
+    }
+
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged event) {
+        if (pathfinderConfig != null) {
+            pathfinderConfig.markDirty();
         }
     }
 
@@ -904,6 +945,18 @@ public class ShortestPathPlugin extends Plugin implements KeyListener {
         {
             return;
         }
+
+        // Route confirmation keys
+        RouteConfirmation confirmation = routeConfirmation;
+        if (confirmation != null && confirmation.isPending()) {
+            int keyCode = e.getKeyCode();
+            if (keyCode == KeyEvent.VK_ENTER || keyCode == KeyEvent.VK_W || keyCode == KeyEvent.VK_ESCAPE) {
+                confirmation.handleKey(keyCode);
+                e.consume();
+                return;
+            }
+        }
+
         /**
          * We took decided to avoid "ESC" as this conflicts with the
          * osrs keybindings and closing the world map

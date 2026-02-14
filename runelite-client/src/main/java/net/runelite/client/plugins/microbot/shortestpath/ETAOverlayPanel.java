@@ -30,8 +30,9 @@ public class ETAOverlayPanel extends OverlayPanel {
             panelComponent.setBackgroundColor(new Color(0, 0, 0, 0));
             panelComponent.setPreferredSize(new Dimension(160, 100));
 
-            if (ShortestPathPlugin.getPathfinder() != null && ShortestPathPlugin.getPathfinder().getPath() != null) {
-                List<WorldPoint> path = ShortestPathPlugin.getPathfinder().getPath();
+            var pathfinder = ShortestPathPlugin.getPathfinder();
+            if (pathfinder != null && pathfinder.isDone() && pathfinder.getPath() != null) {
+                List<WorldPoint> path = pathfinder.getPath();
                 WorldPoint playerLocation = Rs2Player.getWorldLocation();
 
                 int progressIndex = findClosestPointIndex(playerLocation, path);

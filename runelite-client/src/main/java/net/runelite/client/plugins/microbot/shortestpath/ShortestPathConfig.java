@@ -364,6 +364,28 @@ public interface ShortestPathConfig extends Config {
         return 5;
     }
 
+    @ConfigItem(
+            keyName = "confirmManualWalks",
+            name = "Confirm manual walks",
+            description = "Show route preview before walking when using shift-click targets",
+            position = 29,
+            section = sectionSettings
+    )
+    default boolean confirmManualWalks() {
+        return false;
+    }
+
+    @ConfigItem(
+            keyName = "confirmScriptWalks",
+            name = "Confirm script walks",
+            description = "Show route preview before walking when scripts initiate walks",
+            position = 30,
+            section = sectionSettings
+    )
+    default boolean confirmScriptWalks() {
+        return false;
+    }
+
     @ConfigSection(
             name = "Display",
             description = "Options for displaying the path on the world map, minimap and scene tiles",

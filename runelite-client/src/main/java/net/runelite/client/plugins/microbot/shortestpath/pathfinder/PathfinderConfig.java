@@ -55,6 +55,11 @@ public class PathfinderConfig {
 	private static final WorldPoint SPIRIT_TREE_HOSIDIUS = new WorldPoint(1693, 3540, 0);
 	private static final WorldPoint SPIRIT_TREE_FARMING_GUILD = new WorldPoint(1251, 3750, 0);
 
+    // Cache: skip expensive refreshTransports/refreshRestrictionData when data is fresh
+    private static final int CACHE_TTL_TICKS = 3; // ~1.8 seconds
+    private volatile int lastRefreshTick = -1;
+    private volatile boolean transportsDirty = true;
+
     private final SplitFlagMap mapData;
     private final ThreadLocal<CollisionMap> map;
     /**
@@ -129,6 +134,11 @@ public class PathfinderConfig {
 
     @Getter
     @Setter
+    // Walk-only mode: skip TELEPORTATION_ITEM and TELEPORTATION_SPELL but allow portals, fairy rings, etc.
+    private volatile boolean walkOnlyMode = false;
+
+    @Getter
+    @Setter
     // Used to include bank items when searching for item requirements
     private volatile boolean useBankItems = false;
 
@@ -153,6 +163,15 @@ public class PathfinderConfig {
 
     public CollisionMap getMap() {
         return map.get();
+    }
+
+    /**
+     * Marks transport/restriction data as stale so the next refresh() will
+     * recompute them. Called by ShortestPathPlugin on inventory, equipment,
+     * varbit, and config change events.
+     */
+    public void markDirty() {
+        transportsDirty = true;
     }
 
     public void refresh(WorldPoint target) {
@@ -189,15 +208,25 @@ public class PathfinderConfig {
         //END microbot variables
 
         if (GameState.LOGGED_IN.equals(client.getGameState())) {
-            refreshTransports(target);
-            //START microbot variables
-            refreshRestrictionData();
+            int currentTick = client.getTickCount();
+            boolean cacheValid = !transportsDirty
+                    && lastRefreshTick >= 0
+                    && (currentTick - lastRefreshTick) < CACHE_TTL_TICKS;
 
+            if (!cacheValid) {
+                refreshTransports(target);
+                //START microbot variables
+                refreshRestrictionData();
+                //END microbot variables
+                lastRefreshTick = currentTick;
+                transportsDirty = false;
+            }
+
+            //START microbot variables
             // Do not switch back to inventory tab if we are inside of the telekinetic room in Mage Training Arena
             if (Rs2Player.getWorldLocation().getRegionID() != 13463) {
                 Rs2Tab.switchTo(InterfaceTab.INVENTORY);
             }
-
             //END microbot variables
         }
     }
@@ -211,6 +240,10 @@ public class PathfinderConfig {
 
         for (Transport teleport : usableTeleports) {
             if (wildernessLevel <= teleport.getMaxWildernessLevel()) {
+                // In walk-only mode, skip teleportation items and spells but allow everything else
+                if (walkOnlyMode && TransportType.isTeleport(teleport.getType())) {
+                    continue;
+                }
                 usableWildyTeleports.add(teleport);
             }
         }
@@ -509,6 +542,12 @@ public class PathfinderConfig {
                 && !Rs2Inventory.hasItemAmount(transport.getCurrencyName(), transport.getCurrencyAmount())
                 && !(ShortestPathPlugin.getPathfinderConfig().useBankItems && Rs2Bank.count(transport.getCurrencyName()) >= transport.getCurrencyAmount())) {
             log.debug("Transport ( O: {} D: {} ) requires {} x {}", transport.getOrigin(), transport.getDestination(), transport.getCurrencyAmount(), transport.getCurrencyName());
+            return false;
+        }
+
+        // In walk-only mode, skip teleportation items and spells
+        if (walkOnlyMode && TransportType.isTeleport(transport.getType())) {
+            log.debug("Transport ( O: {} D: {} ) is a teleport item/spell but walk-only mode is active", transport.getOrigin(), transport.getDestination());
             return false;
         }
 

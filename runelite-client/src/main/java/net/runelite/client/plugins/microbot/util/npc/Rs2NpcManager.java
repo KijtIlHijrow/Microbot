@@ -159,7 +159,7 @@ public class Rs2NpcManager {
             locationMap.put(npcName, converted);
         }
 
-        Microbot.log("Loaded {} NPC names with location data from {}", locationMap.size(), filename);
+        Microbot.log("Loaded %d NPC names with location data from %s", locationMap.size(), filename);
     }
 
     /**

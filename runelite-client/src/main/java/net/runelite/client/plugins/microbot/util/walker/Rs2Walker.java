@@ -73,6 +73,16 @@ public class Rs2Walker {
     static int stuckCount = 0;
     static WorldPoint lastPosition;
     static volatile WorldPoint currentTarget;
+    private static volatile List<RouteSegment> activeRouteSegments;
+    private static volatile boolean routeConfirmed;
+
+    public static WorldPoint getCurrentTarget() {
+        return currentTarget;
+    }
+
+    public static List<RouteSegment> getActiveRouteSegments() {
+        return activeRouteSegments;
+    }
     static int nextWalkingDistance = 10;
 
     static final int OFFSET = 10; // max offset of the exact area we teleport to
@@ -91,6 +101,115 @@ public class Rs2Walker {
         882, 881    // open manhole -> closed manhole
     );
 
+    /** Small reaction-time pause before clicking something (50-200ms gaussian). */
+    private static void humanReact() {
+        sleepGaussian(Rs2Random.between(80, 160), 40);
+    }
+
+    /** Longer pause simulating reading dialogue text (300-800ms gaussian). */
+    private static void humanRead() {
+        sleepGaussian(Rs2Random.between(400, 700), 120);
+    }
+
+    /** Short pause between sequential widget clicks (150-400ms gaussian). */
+    private static void humanPace() {
+        sleepGaussian(Rs2Random.between(200, 350), 60);
+    }
+
+    /**
+     * Move mouse naturally to target area before interacting.
+     * Provides both a plausible mouse trail and a reaction-time delay.
+     * Falls back to humanReact() if NaturalMouse is unavailable or bounds are invalid.
+     */
+    private static void humanHover(Rectangle bounds) {
+        if (Microbot.getNaturalMouse() == null || bounds == null) {
+            humanReact();
+            return;
+        }
+        // Skip if bounds look like the fallback default rectangle (covers most of screen)
+        if (bounds.width > 300 || bounds.height > 300) {
+            humanReact();
+            return;
+        }
+        try {
+            Point point = Rs2UiHelper.getClickingPoint(bounds, true);
+            if (point.getX() <= 0 && point.getY() <= 0) {
+                humanReact();
+                return;
+            }
+            Microbot.getNaturalMouse().moveTo(point.getX(), point.getY());
+        } catch (Exception e) {
+            humanReact();
+        }
+    }
+
+    private static void humanHover(TileObject object) {
+        if (object == null) { humanReact(); return; }
+        humanHover(Rs2UiHelper.getObjectClickbox(object));
+    }
+
+    private static void humanHover(Widget widget) {
+        if (widget == null) { humanReact(); return; }
+        humanHover(widget.getBounds());
+    }
+
+    private static void humanHover(Actor actor) {
+        if (actor == null) { humanReact(); return; }
+        humanHover(Rs2UiHelper.getActorClickbox(actor));
+    }
+
+    /**
+     * Get bounds of an equipment slot widget for hover/right-click targeting.
+     * Must be called after switching to the equipment tab.
+     */
+    private static Rectangle getEquipmentSlotBounds(Rs2ItemModel rs2Item) {
+        if (rs2Item == null) return null;
+        int childId = -1;
+        int slot = rs2Item.getSlot();
+        if (slot == EquipmentInventorySlot.HEAD.getSlotIdx()) childId = 15;
+        else if (slot == EquipmentInventorySlot.CAPE.getSlotIdx()) childId = 16;
+        else if (slot == EquipmentInventorySlot.AMULET.getSlotIdx()) childId = 17;
+        else if (slot == EquipmentInventorySlot.WEAPON.getSlotIdx()) childId = 18;
+        else if (slot == EquipmentInventorySlot.BODY.getSlotIdx()) childId = 19;
+        else if (slot == EquipmentInventorySlot.SHIELD.getSlotIdx()) childId = 20;
+        else if (slot == EquipmentInventorySlot.LEGS.getSlotIdx()) childId = 21;
+        else if (slot == EquipmentInventorySlot.GLOVES.getSlotIdx()) childId = 22;
+        else if (slot == EquipmentInventorySlot.BOOTS.getSlotIdx()) childId = 23;
+        else if (slot == EquipmentInventorySlot.RING.getSlotIdx()) childId = 24;
+        else if (slot == EquipmentInventorySlot.AMMO.getSlotIdx()) childId = 25;
+        if (childId == -1) return null;
+        Widget widget = Rs2Widget.getWidget(InterfaceID.WORNITEMS, childId);
+        return (widget != null) ? widget.getBounds() : null;
+    }
+
+    /**
+     * Simulates a human right-clicking an item: moves mouse to item, right-clicks
+     * to open the context menu, and pauses briefly as if reading the options.
+     * Falls back to humanReact() if bounds are unavailable.
+     */
+    private static void humanRightClick(Rectangle bounds) {
+        if (Microbot.getNaturalMouse() == null || bounds == null
+                || bounds.width > 300 || bounds.height > 300) {
+            humanReact();
+            return;
+        }
+        try {
+            Point point = Rs2UiHelper.getClickingPoint(bounds, true);
+            if (point.getX() <= 0 && point.getY() <= 0) {
+                humanReact();
+                return;
+            }
+            // Move mouse naturally to item
+            Microbot.getNaturalMouse().moveTo(point.getX(), point.getY());
+            // Right-click to open context menu (no targetMenu — just visual)
+            Microbot.getMouse().click(point, true);
+            // Pause as if reading menu options
+            sleepGaussian(Rs2Random.between(250, 450), 80);
+        } catch (Exception e) {
+            humanReact();
+        }
+    }
+
     public static boolean walkTo(int x, int y, int plane) {
         return walkTo(x, y, plane, config.reachedDistance());
     }
@@ -108,6 +227,7 @@ public class Rs2Walker {
         return walkWithState(target, distance) == WalkerState.ARRIVED;
     }
     public static WalkerState walkWithState(WorldPoint target, int distance) {
+        routeConfirmed = false;
         boolean walkWithBankedTransports = config.walkWithBankedTransports();
         if (walkWithBankedTransports){
             return walkWithBankedTransportsAndState(target, distance,false);
@@ -228,6 +348,104 @@ public class Rs2Walker {
                 return WalkerState.ARRIVED;
             }
 
+            // Route confirmation check (skip if already confirmed for this walk)
+            RouteConfirmation routeConfirmation = ShortestPathPlugin.getRouteConfirmation();
+            if (!routeConfirmed && routeConfirmation != null && config != null) {
+                ShortestPathScript shortestPathScript = ShortestPathPlugin.getShortestPathScript();
+                boolean isManual = shortestPathScript != null && shortestPathScript.getTriggerWalker() != null;
+                boolean needConfirmation = (isManual && config.confirmManualWalks()) || (!isManual && config.confirmScriptWalks());
+
+                if (needConfirmation) {
+                    routeConfirmation.analyze(path);
+
+                    // Compute missing transport items for the confirmation overlay
+                    try {
+                        List<Transport> pathTransports = getTransportsForPath(path, 0, TransportType.TELEPORTATION_ITEM, true);
+                        List<Transport> missing = getMissingTransports(pathTransports);
+                        Map<Integer, Integer> missingIds = getMissingTransportItemIdsWithQuantities(missing);
+
+                        if (!missingIds.isEmpty()) {
+                            List<RouteConfirmation.MissingItemInfo> missingItems = new ArrayList<>();
+                            net.runelite.client.game.ItemManager itemManager = Microbot.getItemManager();
+                            for (Map.Entry<Integer, Integer> entry : missingIds.entrySet()) {
+                                net.runelite.api.ItemComposition comp = itemManager.getItemComposition(entry.getKey());
+                                missingItems.add(new RouteConfirmation.MissingItemInfo(
+                                        comp.getName(), entry.getValue()));
+                            }
+                            routeConfirmation.setMissingItems(missingItems);
+                        }
+                    } catch (Exception e) {
+                        log.debug("Could not compute missing transport items: {}", e.getMessage());
+                    }
+
+                    routeConfirmation.show(ShortestPathPlugin.getConfirmOverlay());
+                    RouteConfirmation.State decision = routeConfirmation.waitForDecision(30_000);
+
+                    switch (decision) {
+                        case WALK_ONLY:
+                            log.info("User chose walk-only, recalculating without teleport items/spells");
+                            routeConfirmation.reset();
+                            routeConfirmed = true;
+                            PathfinderConfig pfConfig = ShortestPathPlugin.getPathfinderConfig();
+                            if (pfConfig != null) {
+                                pfConfig.setWalkOnlyMode(true);
+                                recalculatePath();
+                                // Wait for the new pathfinder to finish
+                                Pathfinder walkOnlyPf = sleepUntilNotNull(ShortestPathPlugin::getPathfinder, 2_000);
+                                if (walkOnlyPf != null) {
+                                    sleepUntilTrue(walkOnlyPf::isDone, 100, 10_000);
+                                    // Check if walk-only path can actually reach the destination
+                                    List<WorldPoint> walkOnlyPath = walkOnlyPf.getPath();
+                                    if (walkOnlyPath != null && !walkOnlyPath.isEmpty()) {
+                                        WorldPoint walkOnlyDst = walkOnlyPath.get(walkOnlyPath.size() - 1);
+                                        if (walkOnlyDst.distanceTo(target) > distance) {
+                                            log.info("Walk-only path cannot reach destination, falling back to full route");
+                                            pfConfig.setWalkOnlyMode(false);
+                                            recalculatePath();
+                                            return WalkerState.MOVING;
+                                        }
+                                    }
+                                }
+                                pfConfig.setWalkOnlyMode(false);
+                            }
+                            return WalkerState.MOVING;
+                        case CANCELLED:
+                            log.info("User cancelled route");
+                            routeConfirmation.reset();
+                            // Clear both the pathfinder target and the script trigger
+                            // so the walk doesn't restart (same as Ctrl+X)
+                            if (shortestPathScript != null) {
+                                shortestPathScript.setTriggerWalker(null);
+                            } else {
+                                setTarget(null);
+                            }
+                            return WalkerState.EXIT;
+                        default:
+                            // CONFIRMED or timeout — continue walking
+                            routeConfirmation.reset();
+                            routeConfirmed = true;
+                            break;
+                    }
+
+                    // Pathfinder may have been cleared by onGameTick during the wait.
+                    // Recalculate so the recursive processWalk call finds a valid pathfinder.
+                    if (ShortestPathPlugin.getPathfinder() == null) {
+                        log.debug("Pathfinder was cleared during confirmation wait, recalculating");
+                        recalculatePath();
+                        return processWalk(target, distance);
+                    }
+                }
+            }
+
+            // Store route segments for the walking overlay
+            if (activeRouteSegments == null && path != null && !path.isEmpty()) {
+                RouteConfirmation rc = ShortestPathPlugin.routeConfirmation;
+                if (rc != null) {
+                    rc.analyze(path);
+                    activeRouteSegments = rc.getSegments();
+                }
+            }
+
             if (isNear(dst)) {
                 setTarget(null);
             }
@@ -261,30 +479,36 @@ public class Rs2Walker {
             if (Rs2Widget.isWidgetVisible(229, 1)) {
                 if (Rs2Dialogue.getDialogueText().equalsIgnoreCase("Warning! The lever will teleport you deep into the Wilderness.")) {
                     log.info("Detected Wilderness lever warning, interacting...");
+                    humanRead();
                     Rs2Dialogue.clickContinue();
                     Rs2Dialogue.sleepUntilHasQuestion("Are you sure you wish to pull it?");
+                    humanRead();
                     Rs2Dialogue.clickOption("Yes, I'm brave.");
                     sleep(1200, 2400);
                 }
             }
 
             // entering desert warning
+            humanReact();
             if (Rs2Widget.clickWidget(565, 20)) {
                 sleepUntil(() -> {
                     Widget checkBoxWidget = Rs2Widget.getWidget(565, 20);
                     if (checkBoxWidget == null) return false;
                     return checkBoxWidget.getSpriteId() != 941;
                 });
+                humanReact();
                 Rs2Widget.clickWidget(565, 17);
             }
 
             // entering down ladder strong hold of security
+            humanReact();
             if (Rs2Widget.clickWidget(579, 20)) {
                 sleepUntil(() -> {
                     Widget checkBoxWidget = Rs2Widget.getWidget(579, 20);
                     if (checkBoxWidget == null) return false;
                     return checkBoxWidget.getSpriteId() != 941;
                 });
+                humanReact();
                 Rs2Widget.clickWidget(579, 17);
             }
 
@@ -755,28 +979,23 @@ public class Rs2Walker {
      * @return A list of `WorldPoint` objects representing the path from the player's current location to the target.
      */
     public static List<WorldPoint> getWalkPath(WorldPoint start, WorldPoint target) {
-        long startTime = System.nanoTime();
         ShortestPathPlugin.getPathfinderConfig().refresh(target);
-        long pathfinderStartTime = System.nanoTime();
+        return runPathfinder(start, target);
+    }
+
+    /**
+     * Runs the pathfinder without refreshing config. Use when the caller has
+     * already called refresh() to avoid redundant transport recalculation.
+     */
+    private static List<WorldPoint> runPathfinder(WorldPoint start, WorldPoint target) {
+        long startTime = System.nanoTime();
         Pathfinder pathfinderLocal = new Pathfinder(ShortestPathPlugin.getPathfinderConfig(), start, target);
         pathfinderLocal.run();
         List<WorldPoint> path = pathfinderLocal.getPath();
-        long pathfinderEndTime = System.nanoTime();
-        long totalEndTime = System.nanoTime();
-        double configTimeMs = (pathfinderStartTime - startTime) / 1_000_000.0;
-        double pathfinderTimeMs = (pathfinderEndTime - pathfinderStartTime) / 1_000_000.0;
-        double totalTimeMs = (totalEndTime - startTime) / 1_000_000.0;
-
-        StringBuilder performanceLog = new StringBuilder();
-        performanceLog.append("getWalkPath Performance: ")
-                .append("Config: ").append(String.format("%.2f ms", configTimeMs))
-                .append(", Pathfinder: ").append(String.format("%.2f ms", pathfinderTimeMs))
-                .append(", Total: ").append(String.format("%.2f ms", totalTimeMs))
-                .append(" | Path: ").append(start).append(" -> ").append(target)
-                .append(" (").append(path.size()).append(" waypoints)");
-
-        log.debug(performanceLog.toString());
-
+        long endTime = System.nanoTime();
+        double timeMs = (endTime - startTime) / 1_000_000.0;
+        log.debug("runPathfinder: {:.2f}ms | {} -> {} ({} waypoints)",
+                String.format("%.2f", timeMs), start, target, path.size());
         return path;
     }
     /**
@@ -1029,6 +1248,7 @@ public class Rs2Walker {
             if (object == null) continue;
 
             if (object.getId() == ObjectID.MOTHERLODE_ROCKFALL_1 || object.getId() == ObjectID.MOTHERLODE_ROCKFALL_2) {
+                humanHover(object);
                 Rs2GameObject.interact(object, "mine");
                 return sleepUntil(() -> Rs2GameObject.getGameObject(point) == null);
             }
@@ -1124,6 +1344,7 @@ public class Rs2Walker {
 
                 if (found) {
                     if (!handleDoorException(object, action)) {
+                        humanHover(object);
                         Rs2GameObject.interact(object, action);
                         Rs2Player.waitForWalking();
                     }
@@ -1148,6 +1369,7 @@ public class Rs2Walker {
     }
 
     private static boolean handleStrongholdOfSecurityAnswer(TileObject object, String action) {
+        humanHover(object);
         Rs2GameObject.interact(object, action);
         boolean isInDialogue = Rs2Dialogue.sleepUntilInDialogue();
 
@@ -1177,8 +1399,10 @@ public class Rs2Walker {
         }
 
         if (dialogueAnswer != null) {
+            humanRead();
             Rs2Dialogue.clickContinue();
             Rs2Dialogue.sleepUntilSelectAnOption();
+            humanRead();
             Rs2Dialogue.clickOption(dialogueAnswer);
             Rs2Dialogue.sleepUntilHasContinue();
             sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
@@ -1305,6 +1529,8 @@ public class Rs2Walker {
         currentTarget = target;
 
         if (target == null) {
+            activeRouteSegments = null;
+
             synchronized (ShortestPathPlugin.getPathfinderMutex()) {
                 final Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
                 if (pathfinder != null) {
@@ -1364,19 +1590,24 @@ public class Rs2Walker {
 
         ShortestPathPlugin.getPathfinderConfig().refresh();
         if (Rs2Player.isInCave()) {
-            pathfinder = new Pathfinder(ShortestPathPlugin.getPathfinderConfig(), start, ends);
-            pathfinder.run();
+            // In caves, try without teleports first (more reliable and cheaper to compute)
             ShortestPathPlugin.getPathfinderConfig().setIgnoreTeleportAndItems(true);
             Pathfinder pathfinderWithoutTeleports = new Pathfinder(ShortestPathPlugin.getPathfinderConfig(), start, ends);
             pathfinderWithoutTeleports.run();
-            var lastPath = pathfinderWithoutTeleports.getPath().get(pathfinderWithoutTeleports.getPath().size()-1);
-            var pathWithoutTeleportsIsReachable = lastPath.distanceTo(ends.stream().findFirst().orElse(lastPath)) <= config.reachedDistance();
-            if (pathWithoutTeleportsIsReachable && pathfinder.getPath().size() >= pathfinderWithoutTeleports.getPath().size()) {
+            ShortestPathPlugin.getPathfinderConfig().setIgnoreTeleportAndItems(false);
+
+            var lastPath = pathfinderWithoutTeleports.getPath().get(pathfinderWithoutTeleports.getPath().size() - 1);
+            var isReachable = lastPath.distanceTo(ends.stream().findFirst().orElse(lastPath)) <= config.reachedDistance();
+
+            if (isReachable) {
+                // Non-teleport path reaches destination — use it, skip second pathfinding
                 ShortestPathPlugin.setPathfinder(pathfinderWithoutTeleports);
             } else {
+                // Can't reach without teleports — fall back to full pathfinding with teleports
+                pathfinder = new Pathfinder(ShortestPathPlugin.getPathfinderConfig(), start, ends);
+                pathfinder.run();
                 ShortestPathPlugin.setPathfinder(pathfinder);
             }
-            ShortestPathPlugin.getPathfinderConfig().setIgnoreTeleportAndItems(false);
         } else {
             ShortestPathPlugin.setPathfinder(new Pathfinder(ShortestPathPlugin.getPathfinderConfig(), start, ends));
             ShortestPathPlugin.setPathfinderFuture(ShortestPathPlugin.getPathfindingExecutor().submit(ShortestPathPlugin.getPathfinder()));
@@ -1454,28 +1685,35 @@ public class Rs2Walker {
 
                             Rs2NpcModel npc = Rs2Npc.getNpc(transport.getName());
 
+                            humanHover(npc != null ? npc.getRuneliteNpc() : null);
                             if (Rs2Npc.canWalkTo(npc, 20) && Rs2Npc.interact(npc, transport.getAction())) {
                                 Rs2Player.waitForWalking();
                                 sleepUntil(Rs2Dialogue::isInDialogue,600*2);
 
                                 if (Objects.equals(transport.getName(), "Veos") && Objects.equals(transport.getAction(), "Talk-to")) {
                                     sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+                                    humanRead();
                                     Rs2Dialogue.clickOption("Can you take me somewhere?");
                                     sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+                                    humanRead();
                                     Rs2Dialogue.clickOption(transport.getDisplayInfo());
                                     sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
                                 }
 
                                 if (Objects.equals(transport.getName(), "Captain Magoro") && Objects.equals(transport.getAction(), "Talk-to")) {
                                     sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+                                    humanRead();
                                     Rs2Dialogue.clickOption(transport.getDisplayInfo());
                                     sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
                                 }
 
+                                humanRead();
                                 if (Rs2Dialogue.clickOption("I'm just going to Pirates' cove")){
                                     sleep(600 * 2);
+                                    humanRead();
                                     Rs2Dialogue.clickContinue();
                                 } else if (Objects.equals(transport.getName(), "Mountain Guide")) {
+                                    humanRead();
                                     Rs2Dialogue.clickOption(transport.getDisplayInfo());
                                 }
                                 sleepUntil(() -> !Rs2Player.isAnimating());
@@ -1637,6 +1875,7 @@ public class Rs2Walker {
     }
 
     private static void handleObject(Transport transport, TileObject tileObject) {
+        humanHover(tileObject);
         Rs2GameObject.interact(tileObject, transport.getAction());
         if (handleObjectExceptions(transport, tileObject)) return;
         if (transport.getDestination().getPlane() == Rs2Player.getWorldLocation().getPlane()) {
@@ -1654,6 +1893,7 @@ public class Rs2Walker {
                 sleep(600 * 2); // wait extra 2 game ticks before moving
             } else {
                 Rs2Player.waitForWalking();
+                humanRead();
                 Rs2Dialogue.clickOption("Yes please"); //shillo village cart
             }
         } else {
@@ -1670,13 +1910,16 @@ public class Rs2Walker {
 
             if (transport.getObjectId() == openTrapdoorId) {
                 if (tileObject.getId() == closedTrapdoorId) {
+                    humanHover(tileObject);
                     Rs2GameObject.interact(tileObject, "Open");
                     sleepUntil(() -> Rs2GameObject.exists(openTrapdoorId));
                     TileObject openTrapdoor = Rs2GameObject.getAll(o -> o.getId() == openTrapdoorId, tileObject.getWorldLocation(), 10).stream().findFirst().orElse(null);
                     if (openTrapdoor != null) {
+                        humanHover(openTrapdoor);
                         Rs2GameObject.interact(openTrapdoor, transport.getAction());
                     }
                 } else if (tileObject.getId() == openTrapdoorId) {
+                    humanHover(tileObject);
                     Rs2GameObject.interact(tileObject, transport.getAction());
                 }
                 sleepUntil(() -> !Rs2Player.isAnimating());
@@ -1695,6 +1938,7 @@ public class Rs2Walker {
         if (tileObject.getId() == ObjectID.REGICIDE_PITFALL_SIDE) {
             Rs2Player.waitForAnimation(1200);
             if (Rs2Player.getWorldLocation().getY() > 6400) {
+                humanReact();
                 Rs2GameObject.interact(ObjectID.REGICIDE_TRAP_HAND_HOLDS);
                 sleepUntil(() -> Rs2Player.getWorldLocation().getY() < 6400);
             } else {
@@ -1706,8 +1950,10 @@ public class Rs2Walker {
         if (tileObject.getId() == ObjectID.WILDY_HUB_ENTRY_BARRIER || tileObject.getId() == ObjectID.WILDY_HUB_ENTRY_BARRIER_M) {
             if (Rs2Dialogue.isInDialogue()) {
                 if (Rs2Dialogue.getDialogueText().toLowerCase().contains("when returning to the enclave")) {
+                    humanRead();
                     Rs2Dialogue.clickContinue();
                     Rs2Dialogue.sleepUntilSelectAnOption();
+                    humanRead();
                     Rs2Dialogue.keyPressForDialogueOption("Yes, and don't ask again.");
                     Rs2Dialogue.sleepUntilNotInDialogue();
                     return true;
@@ -1723,6 +1969,7 @@ public class Rs2Walker {
             if (doesWebStillExist) {
                 sleepUntil(() -> Rs2GameObject.getAll(o -> Objects.equals(webLocation, o.getWorldLocation()) && o.getId() == ObjectID.BIGWEB_SLASHABLE).stream().findFirst().isEmpty(),
                         () -> {
+                            humanHover(tileObject);
                             Rs2GameObject.interact(tileObject, "slash");
                             Rs2Player.waitForAnimation();
                         }, 8000, 1200);
@@ -1737,6 +1984,7 @@ public class Rs2Walker {
                 Rs2Player.waitForWalking();
             }
             Rs2Dialogue.sleepUntilHasQuestion("Pay 875 coins to enter?");
+            humanRead();
             Rs2Dialogue.clickOption("Yes");
             sleepUntil(() -> Rs2Player.getWorldLocation().equals(transport.getDestination()));
             return true;
@@ -1759,6 +2007,7 @@ public class Rs2Walker {
                 Rs2Player.waitForWalking();
             }
             Rs2Dialogue.sleepUntilInDialogue();
+            humanRead();
             Rs2Dialogue.clickOption("yes");
             return true;
         }
@@ -1775,8 +2024,10 @@ public class Rs2Walker {
             }
             Widget dialogueSprite = Rs2Dialogue.getDialogueSprite();
             if (dialogueSprite != null && dialogueSprite.getItemId() == 1004) {
+                humanRead();
                 Rs2Dialogue.clickContinue();
                 Rs2Dialogue.sleepUntilSelectAnOption();
+                humanRead();
                 Rs2Dialogue.clickOption("Yes, don't ask again");
                 Rs2Dialogue.sleepUntilNotInDialogue();
             }
@@ -1806,6 +2057,7 @@ public class Rs2Walker {
 
         if (tileObject.getId() == ObjectID.AERIAL_FISHING_BOAT) {
             Rs2Dialogue.sleepUntilSelectAnOption();
+            humanRead();
             Rs2Dialogue.clickOption(transport.getDisplayInfo(), true);
             sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo2D(transport.getDestination()) < OFFSET, 10000);
             return true;
@@ -1822,6 +2074,7 @@ public class Rs2Walker {
         GameObject obelisk = Rs2GameObject.getGameObject(obj -> obj.getId() == transport.getObjectId(), transport.getOrigin());
 
         if (obelisk != null) {
+            humanHover(obelisk);
             Rs2GameObject.interact(obelisk, transport.getAction());
             sleepUntil(() -> Rs2GameObject.getGameObject(obj -> obj.getId() == transport.getObjectId(), transport.getOrigin()) != null);
             walkFastCanvas(transport.getOrigin());
@@ -1848,6 +2101,7 @@ public class Rs2Walker {
 
         MagicAction magicSpell = Arrays.stream(MagicAction.values()).filter(x -> x.getName().toLowerCase().contains(spellName)).findFirst().orElse(null);
         if (magicSpell != null) {
+            humanReact();
             return Rs2Magic.cast(magicSpell, option, identifier);
         }
         return false;
@@ -1906,11 +2160,13 @@ public class Rs2Walker {
         }
 
         if (itemAction != null) {
+            humanRightClick(Rs2Inventory.itemBounds(rs2Item));
             boolean interaction = Rs2Inventory.interact(rs2Item, itemAction);
             if (!interaction) {
                 return false;
             } else if (wildernessTransport) {
                 Rs2Dialogue.sleepUntilInDialogue();
+                humanRead();
                 return Rs2Dialogue.clickOption("Yes", "Okay");
             }
             return true;
@@ -1924,6 +2180,7 @@ public class Rs2Walker {
             return false;
         }
 
+        humanRightClick(Rs2Inventory.itemBounds(rs2Item));
         if (Rs2Inventory.interact(itemId, itemAction)) {
             log.debug("Traveling with genericAction={}, to {} - ({})", itemAction, transport.getDisplayInfo(), transport.getDestination());
 
@@ -1932,17 +2189,20 @@ public class Rs2Walker {
             } else if (isDialogueBasedTeleportItem(transport.getDisplayInfo())) {
                 // Multi-destination teleport items: wait for destination selection dialogue
                 Rs2Dialogue.sleepUntilSelectAnOption();
+                humanRead();
                 Rs2Dialogue.clickOption(destination);
                 log.info("Traveling to {} - ({})", transport.getDisplayInfo(), transport.getDestination());
                 return true;
             } else if (transport.getDisplayInfo().toLowerCase().contains("burning amulet")) {
                 // Burning amulet in inventory: confirm wilderness teleport
                 Rs2Dialogue.sleepUntilInDialogue();
+                humanRead();
                 Rs2Dialogue.clickOption("Okay, teleport to level");
                 log.info("Traveling to {} - ({})", transport.getDisplayInfo(), transport.getDestination());
                 return true;
             } else if (wildernessTransport) {
                 Rs2Dialogue.sleepUntilInDialogue();
+                humanRead();
                 return Rs2Dialogue.clickOption("Yes", "Okay");
             } else {
                 Rs2Player.waitForAnimation();
@@ -1960,13 +2220,19 @@ public class Rs2Walker {
             String destination = values[1].trim().toLowerCase();
 
             if (transport.getDisplayInfo().toLowerCase().contains("slayer ring")) {
+                Rs2Tab.switchTo(InterfaceTab.EQUIPMENT);
+                humanRightClick(getEquipmentSlotBounds(rs2Item));
                 Rs2Equipment.invokeMenu(rs2Item, "teleport");
                 Rs2Dialogue.sleepUntilSelectAnOption();
+                humanRead();
                 Rs2Dialogue.clickOption(destination);
             } else {
+                Rs2Tab.switchTo(InterfaceTab.EQUIPMENT);
+                humanRightClick(getEquipmentSlotBounds(rs2Item));
                 Rs2Equipment.invokeMenu(rs2Item, destination);
                 if (transport.getDisplayInfo().toLowerCase().contains("burning amulet")) {
                     Rs2Dialogue.sleepUntilInDialogue();
+                    humanRead();
                     Rs2Dialogue.clickOption("Okay, teleport to level");
                 }
             }
@@ -2134,6 +2400,7 @@ public class Rs2Walker {
 
         if (!Rs2Widget.isWidgetVisible(ComponentID.ADVENTURE_LOG_CONTAINER)) {
             TileObject spiritTree = Rs2GameObject.findObjectById(objectId);
+            humanHover(spiritTree);
             if (!Rs2GameObject.interact(spiritTree, "Travel")) {
                 return false;
             }
@@ -2162,6 +2429,7 @@ public class Rs2Walker {
         }
 
         if (Rs2Tab.getCurrentTab() != InterfaceTab.CHAT) {
+            humanReact();
             Rs2Tab.switchTo(InterfaceTab.CHAT);
             sleepUntil(() -> Rs2Tab.getCurrentTab() == InterfaceTab.CHAT);
         }
@@ -2170,6 +2438,7 @@ public class Rs2Walker {
         if (groupingBtn == null) return false;
 
         if (!Arrays.equals(groupingBtn.getOnOpListener(), selectedOpListener)) {
+            humanHover(groupingBtn);
             Rs2Widget.clickWidget(groupingBtn);
             sleepUntil(() -> Arrays.equals(groupingBtn.getOnOpListener(), selectedOpListener));
         }
@@ -2186,6 +2455,7 @@ public class Rs2Walker {
             if (dropdownBtn == null) return false;
 
             if (dropdownBtn.getSpriteId() != DROPDOWN_SELECTED_SPRITE_ID) {
+                humanHover(dropdownBtn);
                 Rs2Widget.clickWidget(dropdownBtn);
                 sleepUntil(() -> Rs2Widget.findWidget(DROPDOWN_SELECTED_SPRITE_ID, List.of(Rs2Widget.getWidget(DROPDOWN_BUTTON_COMPONENT_ID))) != null);
             }
@@ -2208,16 +2478,19 @@ public class Rs2Walker {
                     .param1(minigameWidgetParent.getId())
                     .forceLeftClick(false);
 
+            humanHover(destinationWidget);
             Microbot.doInvoke(destinationMenuEntry, new Rectangle(1, 1));
             sleepUntil(() -> Rs2Widget.getWidget(SELECTED_MINIGAME).getText().equalsIgnoreCase(destination));
         }
 
         Widget teleportBtn = Rs2Widget.getWidget(TELEPORT_BUTTON);
         if (teleportBtn == null) return false;
+        humanHover(teleportBtn);
         Rs2Widget.clickWidget(teleportBtn);
 
         if (transport.getDisplayInfo().toLowerCase().contains("rat pits")) {
             Rs2Dialogue.sleepUntilSelectAnOption();
+            humanRead();
             Rs2Dialogue.clickOption(transport.getDisplayInfo().split(":")[1].trim().toLowerCase());
         }
 
@@ -2243,6 +2516,7 @@ public class Rs2Walker {
 
         switch (currentAction) {
             case "Chop-down":
+                humanReact();
                 Rs2GameObject.interact(transport.getObjectId(), "Chop-down");
                 sleepUntil(() -> Rs2Player.isAnimating(1200));
                 return sleepUntilTrue(() -> {
@@ -2255,6 +2529,7 @@ public class Rs2Walker {
                 @Component final int CANOE_SELECTION_PARENT = 27262976; // 416.3
                 @Component final int CANOE_SHAPING_TEXT = 27262986; // 416.10
 
+                humanReact();
                 Rs2GameObject.interact(transport.getObjectId(), "Shape-Canoe");
                 boolean isCanoeShapeTextVisible = sleepUntilTrue(() -> Rs2Widget.isWidgetVisible(CANOE_SHAPING_TEXT), 100, 10000);
                 if (!isCanoeShapeTextVisible) {
@@ -2280,6 +2555,7 @@ public class Rs2Walker {
                 Widget canoeSelectionParentWidget = Rs2Widget.getWidget(CANOE_SELECTION_PARENT);
                 if (canoeSelectionParentWidget == null) return false;
                 Widget canoeSelectionWidget = Rs2Widget.findWidget("Make " + canoeOption, List.of(canoeSelectionParentWidget));
+                humanHover(canoeSelectionWidget);
                 Rs2Widget.clickWidget(canoeSelectionWidget);
                 sleepUntil(() -> Rs2Player.isAnimating(1200));
                 return sleepUntilTrue(() -> {
@@ -2289,6 +2565,7 @@ public class Rs2Walker {
                     return Arrays.stream(composition.getActions()).filter(Objects::nonNull).noneMatch(currentAction::equals) && !Rs2Player.isAnimating();
                 }, 300, 10000);
             case "Float Canoe":
+                humanReact();
                 Rs2GameObject.interact(transport.getObjectId(), "Float Canoe");
                 sleepUntil(() -> Rs2Player.isAnimating(1200));
                 return sleepUntilTrue(() -> {
@@ -2301,6 +2578,7 @@ public class Rs2Walker {
                 @Component final int DESTINATION_MAP_PARENT = 42401792; // 647.3
                 @Component final int DESTINATION_LIST = 42401795; // 647.13
 
+                humanReact();
                 Rs2GameObject.interact(transport.getObjectId(), "Paddle Canoe");
 
                 boolean isDestinationMapVisible = sleepUntilTrue(() -> Rs2Widget.isWidgetVisible(DESTINATION_MAP_PARENT), 100, 10000);
@@ -2312,6 +2590,7 @@ public class Rs2Walker {
                 Widget destinationListWidget = Rs2Widget.getWidget(DESTINATION_LIST);
                 if (destinationListWidget == null) return false;
                 Widget destination = Rs2Widget.findWidget("Travel to " + displayInfo, List.of(destinationListWidget), false);
+                humanHover(destination);
                 Rs2Widget.clickWidget(destination);
 
                 Rs2Dialogue.waitForCutScene(100, 15000);
@@ -2330,6 +2609,7 @@ public class Rs2Walker {
 
         Rs2NpcModel renu = Rs2Npc.getNpc(NpcID.QUETZAL_CHILD_GREEN);
 
+        humanHover(renu != null ? renu.getRuneliteNpc() : null);
         if (Rs2Tile.isTileReachable(transport.getOrigin()) && Rs2Npc.interact(renu, "travel")) {
             Rs2Player.waitForWalking();
             boolean isVarlamoreMapVisible = sleepUntilTrue(() -> Rs2Widget.isWidgetVisible(VARLAMORE_QUETZAL_MAP), 100, 10000);
@@ -2346,6 +2626,7 @@ public class Rs2Walker {
 
             Widget actionWidget = Rs2Widget.findWidget(displayInfo, quetzalMapChildren, false);
             if (actionWidget != null) {
+                humanHover(actionWidget);
                 Rs2Widget.clickWidget(actionWidget);
                 log.info("Traveling to {} - ({})", transport.getDisplayInfo(), transport.getDestination());
                 return sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo2D(transport.getDestination()) < OFFSET, 100, 5000);
@@ -2368,9 +2649,11 @@ public class Rs2Walker {
 
         Widget destinationWidget = Rs2Widget.findWidget(destination, bookOfScrollsChildren, false);
         if (destinationWidget == null) return false;
+        humanHover(destinationWidget);
         boolean interaction = Rs2Widget.clickWidget(destinationWidget);
         if (interaction && destination.equalsIgnoreCase("Revenant cave")) {
             Rs2Dialogue.sleepUntilInDialogue();
+            humanRead();
             return Rs2Dialogue.clickOption("Yes, teleport me now");
         }
         return interaction;
@@ -2381,8 +2664,10 @@ public class Rs2Walker {
         var rugMerchant = Rs2Npc.getNpc(transport.getObjectId());
         if (rugMerchant == null) return false;
 
+        humanHover(rugMerchant.getRuneliteNpc());
         Rs2Npc.interact(rugMerchant, transport.getAction());
         Rs2Dialogue.sleepUntilInDialogue();
+        humanRead();
         Rs2Dialogue.clickOption(transport.getDisplayInfo());
         sleepUntil(() -> Rs2Player.getPoseAnimation() == flyingPoseAnimation, 10000);
         return sleepUntilTrue(() -> Rs2Player.getPoseAnimation() != flyingPoseAnimation, 600,60000);
@@ -2393,6 +2678,7 @@ public class Rs2Walker {
 
         Rs2NpcModel npc = Rs2Npc.getNpc(npcName);
         log.info("Charter Ship NPC: " + npcName + " - " + (npc != null ? npc.getId() : "not found"));
+        humanHover(npc != null ? npc.getRuneliteNpc() : null);
         if (Rs2Npc.canWalkTo(npc, 20) && Rs2Npc.interact(npc, transport.getAction())) {
             Rs2Player.waitForWalking();
             sleepUntil(() -> Rs2Widget.isWidgetVisible(885, 4));
@@ -2418,6 +2704,7 @@ public class Rs2Walker {
                     .param1(destinationWidget.getId())
                     .forceLeftClick(false);
 
+            humanHover(destinationWidget);
             Microbot.doInvoke(destinationMenuEntry, new Rectangle(1, 1));
             return true;
         }
@@ -2443,6 +2730,7 @@ public class Rs2Walker {
         Widget destinationWidget = Rs2Widget.findWidget(destinationString, List.of(Rs2Widget.getWidget(187, 3)));
         if (destinationWidget == null) return false;
 
+        humanReact();
         Rs2Widget.clickWidget(destinationWidget);
         log.info("Traveling to {} - ({})", transport.getDisplayInfo(), transport.getDestination());
         return sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo2D(transport.getDestination()) < OFFSET, 100, 5000);
@@ -2475,6 +2763,7 @@ public class Rs2Walker {
             }
 
             // Interact with the gnome glider NPC
+            humanHover(gnome.getRuneliteNpc());
             if (Rs2Npc.interact(gnome, action)) {
                 sleepUntil(() -> !Rs2Widget.isHidden(GLIDER_PARENT_WIDGET, GLIDER_CHILD_WIDGET));
             }
@@ -2491,25 +2780,21 @@ public class Rs2Walker {
 
         if (displayInfo.isEmpty()) return false;
 
+        int targetWidgetId;
         switch (displayInfo) {
-            case "Kar-Hewo":
-                return Rs2Widget.clickWidget(KAR_HEWO);
-            case "Ta Quir Priw":
-                return Rs2Widget.clickWidget(TA_QUIR_PRIW);
-            case "Sindarpos":
-                return Rs2Widget.clickWidget(SINDARPOS);
-            case "Lemanto Andra":
-                return Rs2Widget.clickWidget(LEMANTO_ANDRA);
-            case "Gandius":
-                return Rs2Widget.clickWidget(GANDIUS);
-            case "Ookookolly Undri":
-                return Rs2Widget.clickWidget(OOKOOKOLLY_UNDRI);
-            case "Lemantolly Undri":
-                return Rs2Widget.clickWidget(LEMANTOLLY_UNDRI);
+            case "Kar-Hewo":        targetWidgetId = KAR_HEWO; break;
+            case "Ta Quir Priw":    targetWidgetId = TA_QUIR_PRIW; break;
+            case "Sindarpos":       targetWidgetId = SINDARPOS; break;
+            case "Lemanto Andra":   targetWidgetId = LEMANTO_ANDRA; break;
+            case "Gandius":         targetWidgetId = GANDIUS; break;
+            case "Ookookolly Undri": targetWidgetId = OOKOOKOLLY_UNDRI; break;
+            case "Lemantolly Undri": targetWidgetId = LEMANTOLLY_UNDRI; break;
             default:
                 log.error("{} not found on the interface.", displayInfo);
                 return false;
         }
+        humanHover(Rs2Widget.getWidget(targetWidgetId));
+        return Rs2Widget.clickWidget(targetWidgetId);
     }
 
     // Constants for widget IDs
@@ -2561,14 +2846,18 @@ public class Rs2Walker {
 
         // we can use the last-destination to handle fairy rings
         if (Rs2GameObject.hasAction(composition, lastDestinationAction, true)) {
+            humanHover(fairyRingObject);
             Rs2GameObject.interact(fairyRingObject, lastDestinationAction);
         } else if (Rs2GameObject.hasAction(composition, treeLastDestinationAction, true)) {
+            humanHover(fairyRingObject);
             Rs2GameObject.interact(fairyRingObject, treeLastDestinationAction);
         } else {
             // We have to configure fairy rings through the interface
             if (Rs2GameObject.hasAction(composition, "Configure", true)) {
+                humanHover(fairyRingObject);
                 Rs2GameObject.interact(fairyRingObject, "Configure");
             } else if (Rs2GameObject.hasAction(composition, "Ring-configure", true)) {
+                humanHover(fairyRingObject);
                 Rs2GameObject.interact(fairyRingObject, "Ring-configure");
             }
             sleepUntil(() -> !Rs2Player.isMoving() && !Rs2Widget.isHidden(ComponentID.FAIRY_RING_TELEPORT_BUTTON), 10000);
@@ -2576,6 +2865,7 @@ public class Rs2Walker {
             rotateSlotToDesiredRotation(SLOT_ONE, Rs2Widget.getWidget(SLOT_ONE).getRotationY(), getDesiredRotation(transport.getDisplayInfo().charAt(0)), SLOT_ONE_ACW_ROTATION, SLOT_ONE_CW_ROTATION);
             rotateSlotToDesiredRotation(SLOT_TWO, Rs2Widget.getWidget(SLOT_TWO).getRotationY(), getDesiredRotation(transport.getDisplayInfo().charAt(1)), SLOT_TWO_ACW_ROTATION, SLOT_TWO_CW_ROTATION);
             rotateSlotToDesiredRotation(SLOT_THREE, Rs2Widget.getWidget(SLOT_THREE).getRotationY(), getDesiredRotation(transport.getDisplayInfo().charAt(2)), SLOT_THREE_ACW_ROTATION, SLOT_THREE_CW_ROTATION);
+            humanHover(Rs2Widget.getWidget(ComponentID.FAIRY_RING_TELEPORT_BUTTON));
             Rs2Widget.clickWidget(ComponentID.FAIRY_RING_TELEPORT_BUTTON);
         }
 
@@ -2611,6 +2901,12 @@ public class Rs2Walker {
 
         for (int i = 0; i < turns; i++) {
             final int previousRotation = currentRotation;
+            Widget rotWidget = Rs2Widget.getWidget(rotationWidget);
+            if (rotWidget != null) {
+                humanHover(rotWidget);
+            } else {
+                humanPace();
+            }
             Rs2Widget.clickWidget(rotationWidget);
 
             sleepUntil(() -> {
@@ -3156,10 +3452,17 @@ public class Rs2Walker {
         }
 
         try {
-            // Get direct path distance with timing
+            // Refresh config once upfront — this is the expensive call that builds transport lists
+            PathfinderConfig pfConfig = ShortestPathPlugin.getPathfinderConfig();
+            long refreshStartTime = System.nanoTime();
+            pfConfig.refresh(target);
+            long refreshEndTime = System.nanoTime();
             performanceLog.append("\tStart Point: ").append(startPoint).append(", Target: ").append(target).append("\n");
+            performanceLog.append("\t-Config refresh: ").append(String.format("%.2f ms", (refreshEndTime - refreshStartTime) / 1_000_000.0)).append("\n");
+
+            // Get direct path distance (pathfinder only, config already refreshed)
             long directPathStartTime = System.nanoTime();
-            List<WorldPoint> directPath = getWalkPath(startPoint, target);
+            List<WorldPoint> directPath = runPathfinder(startPoint, target);
             long directPathEndTime = System.nanoTime();
             double directPathTimeMs = (directPathEndTime - directPathStartTime) / 1_000_000.0;
 
@@ -3174,19 +3477,15 @@ public class Rs2Walker {
             int bankingRouteDistance = -1;
 
             try {
-
-
-
-
-                boolean originalUseBankItems = ShortestPathPlugin.getPathfinderConfig().isUseBankItems();
+                boolean originalUseBankItems = pfConfig.isUseBankItems();
                 try {
-                    ShortestPathPlugin.getPathfinderConfig().setUseBankItems(true);
-                    ShortestPathPlugin.getPathfinderConfig().refresh(target);
+                    pfConfig.setUseBankItems(true);
+                    pfConfig.refresh(target); // Re-refresh needed: bank items change available transports
 
                     performanceLog.append("\t-Bank items available: ").append(Rs2Bank.bankItems().size()).append("\n");
 
                     long pathWithBankedItemsStartTime = System.nanoTime();
-                    pathWithBankedItemsToTarget = getWalkPath(startPoint, target);
+                    pathWithBankedItemsToTarget = runPathfinder(startPoint, target);
                     long pathWithBankedItemsEndTime = System.nanoTime();
                     double pathWithBankedItemsTimeMs = (pathWithBankedItemsEndTime - pathWithBankedItemsStartTime) / 1_000_000.0;
 
@@ -3198,9 +3497,9 @@ public class Rs2Walker {
                     performanceLog.append("\t-Total banking route distance: ").append(bankingRouteDistance).append(" tiles\n");
 
                 } finally {
-                    // Always restore original configuration
-                    ShortestPathPlugin.getPathfinderConfig().setUseBankItems(false);
-                    ShortestPathPlugin.getPathfinderConfig().refresh();
+                    // Restore original configuration
+                    pfConfig.setUseBankItems(originalUseBankItems);
+                    pfConfig.refresh();
                 }
                 if (bankingRouteDistance<directDistance){
                     long bankSearchStartTime = System.nanoTime();
@@ -3212,9 +3511,9 @@ public class Rs2Walker {
                         WorldPoint bankLocation = nearestBank.getWorldPoint();
                         performanceLog.append("\t -> Found: ").append(nearestBank).append(" at ").append(bankLocation).append("\n");
 
-                        // Calculate distance from start point to bank
+                        // Calculate distance from start point to bank (config already fresh)
                         long pathToBankStartTime = System.nanoTime();
-                        pathToBank = getWalkPath(startPoint, bankLocation);
+                        pathToBank = runPathfinder(startPoint, bankLocation);
                         long pathToBankEndTime = System.nanoTime();
                         double pathToBankTimeMs = (pathToBankEndTime - pathToBankStartTime) / 1_000_000.0;
 
@@ -3299,6 +3598,7 @@ public class Rs2Walker {
      * @return true if travel was successful, false otherwise
      */
     public static WalkerState walkWithBankedTransportsAndState(WorldPoint target, int distance, boolean forceBanking) {
+        routeConfirmed = false;
         if (target == null) {
             log.warn("Cannot travel to null target location");
             return WalkerState.EXIT;
@@ -3318,6 +3618,95 @@ public class Rs2Walker {
             return WalkerState.MOVING;
         }
         Rs2Walker.currentTarget =  null;
+
+        // Route confirmation check (before banking decision)
+        if (!routeConfirmed) {
+            RouteConfirmation routeConfirmation = ShortestPathPlugin.getRouteConfirmation();
+            if (routeConfirmation != null && config != null) {
+                ShortestPathScript shortestPathScript = ShortestPathPlugin.getShortestPathScript();
+                boolean isManual = shortestPathScript != null && shortestPathScript.getTriggerWalker() != null;
+                boolean needConfirmation = (isManual && config.confirmManualWalks()) || (!isManual && config.confirmScriptWalks());
+
+                if (needConfirmation) {
+                    // Calculate path to show in confirmation
+                    setTarget(target);
+                    ShortestPathPlugin.setReachedDistance(distance);
+                    Pathfinder pf = sleepUntilNotNull(ShortestPathPlugin::getPathfinder, 2_000);
+                    if (pf != null) {
+                        sleepUntilTrue(pf::isDone, 100, 10_000);
+                        List<WorldPoint> confirmPath = pf.getPath();
+                        if (confirmPath != null && !confirmPath.isEmpty()) {
+                            routeConfirmation.analyze(confirmPath);
+
+                            // Compute missing transport items for the confirmation overlay
+                            try {
+                                List<Transport> confirmTransports = getTransportsForPath(confirmPath, 0, TransportType.TELEPORTATION_ITEM, true);
+                                List<Transport> confirmMissing = getMissingTransports(confirmTransports);
+                                Map<Integer, Integer> confirmMissingIds = getMissingTransportItemIdsWithQuantities(confirmMissing);
+
+                                if (!confirmMissingIds.isEmpty()) {
+                                    List<RouteConfirmation.MissingItemInfo> missingItemInfos = new ArrayList<>();
+                                    net.runelite.client.game.ItemManager itemManager = Microbot.getItemManager();
+                                    for (Map.Entry<Integer, Integer> entry : confirmMissingIds.entrySet()) {
+                                        net.runelite.api.ItemComposition comp = itemManager.getItemComposition(entry.getKey());
+                                        missingItemInfos.add(new RouteConfirmation.MissingItemInfo(
+                                                comp.getName(), entry.getValue()));
+                                    }
+                                    routeConfirmation.setMissingItems(missingItemInfos);
+                                }
+                            } catch (Exception e) {
+                                log.debug("Could not compute missing transport items: {}", e.getMessage());
+                            }
+
+                            routeConfirmation.show(ShortestPathPlugin.getConfirmOverlay());
+                            RouteConfirmation.State decision = routeConfirmation.waitForDecision(30_000);
+
+                            switch (decision) {
+                                case WALK_ONLY:
+                                    log.info("User chose walk-only (banked transport), skipping banking");
+                                    routeConfirmation.reset();
+                                    routeConfirmed = true;
+                                    PathfinderConfig walkOnlyPfConfig = ShortestPathPlugin.getPathfinderConfig();
+                                    if (walkOnlyPfConfig != null) {
+                                        walkOnlyPfConfig.setWalkOnlyMode(true);
+                                    }
+                                    setTarget(null);
+                                    WalkerState walkOnlyResult;
+                                    try {
+                                        walkOnlyResult = walkWithStateInternal(target, distance);
+                                    } finally {
+                                        if (walkOnlyPfConfig != null) {
+                                            walkOnlyPfConfig.setWalkOnlyMode(false);
+                                        }
+                                    }
+                                    if (walkOnlyResult == WalkerState.UNREACHABLE) {
+                                        log.info("Walk-only cannot reach destination, falling back to banking flow");
+                                        setTarget(null);
+                                        // Don't return here — break out to the banking flow below
+                                        break;
+                                    }
+                                    return walkOnlyResult;
+                                case CANCELLED:
+                                    log.info("User cancelled route (banked transport)");
+                                    routeConfirmation.reset();
+                                    if (shortestPathScript != null) {
+                                        shortestPathScript.setTriggerWalker(null);
+                                    } else {
+                                        setTarget(null);
+                                    }
+                                    return WalkerState.EXIT;
+                                default:
+                                    routeConfirmation.reset();
+                                    routeConfirmed = true;
+                                    break;
+                            }
+                        }
+                    }
+                    setTarget(null); // Clear so the banking flow can set its own targets
+                }
+            }
+        }
+
         // Check what transport items are needed
         TransportRouteAnalysis comparison = compareRoutes(target);
         List<Transport> missingTransports = getMissingTransports(getTransportsForDestination(target, true, TransportType.TELEPORTATION_SPELL));
@@ -3335,7 +3724,7 @@ public class Rs2Walker {
             if (state == WalkerState.ARRIVED) {
                 log.info("\n\tArrived directly at target: " + target);
             } else {
-                log.warn("\n\tFailed to arrive directly at target: " + target + ", state: " + state);
+                log.info("\n\tWalking ended before reaching target: " + target + ", state: " + state);
                 setTarget(null);
                 return state;
 
