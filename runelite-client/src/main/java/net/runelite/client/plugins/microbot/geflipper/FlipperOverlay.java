@@ -34,20 +34,22 @@ public class FlipperOverlay extends OverlayPanel {
         panelComponent.setPreferredSize(new Dimension(190, 0));
 
         // Title with state-dependent color
-        Color titleColor = getTitleColor();
+        boolean paused = flipperScript.manuallyPaused;
+        Color titleColor = paused ? Color.YELLOW : getTitleColor();
         panelComponent.getChildren().add(TitleComponent.builder()
-                .text("Flipper v1.1.0")
+                .text("Flippeith v" + FlipperPlugin.version)
                 .color(titleColor)
                 .build());
 
-        panelComponent.getChildren().add(LineComponent.builder().build());
-
-        // State
-        panelComponent.getChildren().add(LineComponent.builder()
-                .left("State:")
-                .right(flipperScript.state.name().replace("_", " "))
-                .rightColor(getStateColor(flipperScript.state))
+        // Pause/Resume hotkey hint (centered)
+        String hint = paused ? "\u25B6 Press F6 to Resume" : "\u23F8 Press F6 to Pause";
+        Color hintColor = paused ? new Color(0, 200, 0) : Color.GRAY;
+        panelComponent.getChildren().add(TitleComponent.builder()
+                .text(hint)
+                .color(hintColor)
                 .build());
+
+        panelComponent.getChildren().add(LineComponent.builder().build());
 
         // Status
         panelComponent.getChildren().add(LineComponent.builder()
@@ -57,7 +59,7 @@ public class FlipperOverlay extends OverlayPanel {
                 .build());
 
         // Break info
-        if (flipperScript.state == State.ON_BREAK) {
+        if (!paused && flipperScript.state == State.ON_BREAK) {
             String breakType = flipperScript.isMacroBreak ? "Macro" : "Micro";
             long remaining = Math.max(0, (flipperScript.breakEndTime - System.currentTimeMillis()) / 1000L);
             panelComponent.getChildren().add(LineComponent.builder()
@@ -65,8 +67,7 @@ public class FlipperOverlay extends OverlayPanel {
                     .right(breakType + " - " + formatTime(remaining))
                     .rightColor(Color.ORANGE)
                     .build());
-        } else {
-            // Next micro break
+        } else if (!paused) {
             long secsUntilMicro = flipperScript.getSecondsUntilMicroBreak();
             if (secsUntilMicro >= 0) {
                 panelComponent.getChildren().add(LineComponent.builder()
@@ -74,8 +75,6 @@ public class FlipperOverlay extends OverlayPanel {
                         .right(formatTime(secsUntilMicro))
                         .build());
             }
-
-            // Next macro break
             long secsUntilMacro = flipperScript.getSecondsUntilMacroBreak();
             if (secsUntilMacro >= 0) {
                 panelComponent.getChildren().add(LineComponent.builder()
@@ -88,7 +87,7 @@ public class FlipperOverlay extends OverlayPanel {
         // Session time remaining
         long secsUntilEnd = flipperScript.getSecondsUntilSessionEnd();
         if (secsUntilEnd >= 0) {
-            boolean urgent = secsUntilEnd < 300; // <5 min
+            boolean urgent = secsUntilEnd < 300;
             panelComponent.getChildren().add(LineComponent.builder()
                     .left("Session left:")
                     .right(formatTime(secsUntilEnd))
@@ -102,13 +101,14 @@ public class FlipperOverlay extends OverlayPanel {
                 .right(String.valueOf(flipperScript.actionCount))
                 .build());
 
-        // Current copilot suggestion
+        // Current copilot suggestion (capitalised)
         String suggestion = flipperScript.getCurrentSuggestionType();
-        if (suggestion != null) {
+        if (suggestion != null && !suggestion.isEmpty()) {
+            String displaySugg = Character.toUpperCase(suggestion.charAt(0)) + suggestion.substring(1);
             Color suggColor = "wait".equals(suggestion) ? Color.GRAY : Color.CYAN;
             panelComponent.getChildren().add(LineComponent.builder()
                     .left("Copilot:")
-                    .right(suggestion)
+                    .right(displaySugg)
                     .rightColor(suggColor)
                     .build());
         }
@@ -156,22 +156,5 @@ public class FlipperOverlay extends OverlayPanel {
             return String.format("%dh %02dm", hours, minutes);
         }
         return String.format("%dm %02ds", minutes, seconds);
-    }
-
-    private Color getStateColor(State state) {
-        switch (state) {
-            case GOING_TO_GE:
-                return Color.YELLOW;
-            case GETTING_COINS:
-                return Color.CYAN;
-            case MONITORING_COPILOT:
-                return Color.GREEN;
-            case ON_BREAK:
-                return Color.ORANGE;
-            case SESSION_ENDING:
-                return Color.RED;
-            default:
-                return Color.WHITE;
-        }
     }
 }

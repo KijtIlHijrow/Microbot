@@ -32,6 +32,7 @@ import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.keyboard.Rs2Keyboard;
 import net.runelite.client.plugins.microbot.util.math.Rs2Random;
 import net.runelite.client.plugins.microbot.util.misc.Rs2UiHelper;
+import net.runelite.client.plugins.microbot.util.gameobject.Rs2GameObject;
 import net.runelite.client.plugins.microbot.util.npc.Rs2Npc;
 import net.runelite.client.plugins.microbot.util.npc.Rs2NpcModel;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
@@ -49,6 +50,7 @@ public class FlipperScript extends Script {
     private final WorldArea grandExchangeArea = new WorldArea(3136, 3465, 61, 54, 0);
 
     State state = State.GOING_TO_GE;
+    volatile boolean manuallyPaused = false;
     private FlipperConfig config;
     private Plugin flippingCopilot;
     private Object suggestionManager;
@@ -83,10 +85,10 @@ public class FlipperScript extends Script {
     // Idle behavior
     private long lastMouseDriftTime = 0L;
     private long nextCameraFidgetTime = 0L;
-    private boolean waitingOffScreen = false;
-    private int tabOutExitEdge = -1; // -1=not yet chosen, 0=bottom, 1=top, 2=left, 3=right
-    private int tabOutExitX = 0;     // exact exit position for consistent re-entry
-    private int tabOutExitY = 0;
+    boolean waitingOffScreen = false;
+    int tabOutExitEdge = -1; // -1=not yet chosen, 0=bottom, 1=top, 2=left, 3=right
+    int tabOutExitX = 0;     // exact exit position for consistent re-entry
+    int tabOutExitY = 0;
     private long tabOutDelayMs = 0L; // "noticing" delay before tabbing out
 
     // Disconnect tracking
@@ -146,6 +148,17 @@ public class FlipperScript extends Script {
             InterfaceTab.QUESTS, InterfaceTab.PRAYER, InterfaceTab.COMBAT
     };
 
+    // ── Manual pause ────────────────────────────────────────────────────
+
+    void toggleManualPause() {
+        manuallyPaused = !manuallyPaused;
+        if (manuallyPaused) {
+            status = "Manually paused";
+        } else {
+            status = "Resuming...";
+        }
+    }
+
     // ── Entry point ─────────────────────────────────────────────────────
 
     public boolean run(FlipperConfig config) {
@@ -164,6 +177,7 @@ public class FlipperScript extends Script {
         this.mainScheduledFuture = this.scheduledExecutorService.scheduleWithFixedDelay(() -> {
             try {
                 if (!super.run()) return;
+                if (manuallyPaused) return;
                 if (!Microbot.isLoggedIn()) {
                     if (disconnectedSince == 0L) {
                         disconnectedSince = System.currentTimeMillis();
@@ -679,6 +693,20 @@ public class FlipperScript extends Script {
             return;
         }
 
+        // Randomly pick between booth and clerk each time (more human)
+        boolean tryBooth = Math.random() < 0.5;
+        if (tryBooth) {
+            if (Rs2GameObject.interact("Grand Exchange booth", "Exchange")) {
+                this.status = "Opening GE (booth)";
+                FlipperScript.sleepUntil(Rs2GrandExchange::isOpen, 5000);
+                if (Rs2GrandExchange.isOpen()) {
+                    this.geOpenAttempts = 0;
+                    return;
+                }
+            }
+            // Booth not found or failed — fall through to clerk
+        }
+
         // Find all GE clerks
         List<Rs2NpcModel> clerks = Rs2Npc.getNpcs("Grand Exchange Clerk", true)
                 .collect(Collectors.toList());
@@ -1065,6 +1093,12 @@ public class FlipperScript extends Script {
      * 2. MOUSE_ENTERED event at the same position we exited from (with tiny variance)
      * 3. Natural mouse movement from edge back into the canvas
      * 4. Small wake-up pause (human re-orienting)
+     *
+     * Note: the paused+tabbed-out case (user pressed F6 during tab-out) is
+     * handled directly in FlipperPlugin's F6 handler, which sets
+     * waitingOffScreen=false before this method can be called. So this
+     * method only runs when the bot is actively running — the user's
+     * physical mouse position is irrelevant here.
      */
     private void simulateTabIn() {
         java.awt.Canvas canvas = Microbot.getClient().getCanvas();
