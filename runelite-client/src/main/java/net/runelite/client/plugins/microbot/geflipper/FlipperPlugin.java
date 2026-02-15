@@ -20,10 +20,10 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.ui.overlay.OverlayManager;
 
-@PluginDescriptor(name="<html>[<font color=#8A2BE2>\u03a9</font>] Flippeith", description="Flipping copilot automation", tags={"flip", "ge", "grand", "exchange", "automation"}, authors={"Choken"}, version="1.2.2", minClientVersion="2.0.7", cardUrl="https://chsami.github.io/Microbot-Hub/FlipperPlugin/assets/card.jpg", iconUrl="https://chsami.github.io/Microbot-Hub/FlipperPlugin/assets/icon.jpg", enabledByDefault=false, isExternal=true)
+@PluginDescriptor(name="<html>[<font color=#8A2BE2>\u03a9</font>] Flippeith", description="Flipping copilot automation", tags={"flip", "ge", "grand", "exchange", "automation"}, authors={"Choken"}, version="1.2.4", minClientVersion="2.0.7", cardUrl="https://chsami.github.io/Microbot-Hub/FlipperPlugin/assets/card.jpg", iconUrl="https://chsami.github.io/Microbot-Hub/FlipperPlugin/assets/icon.jpg", enabledByDefault=false, isExternal=true)
 public class FlipperPlugin
 extends Plugin {
-    public static final String version = "1.2.2";
+    public static final String version = "1.2.4";
     @Inject
     private Client client;
     @Inject

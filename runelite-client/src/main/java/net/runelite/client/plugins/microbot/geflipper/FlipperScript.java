@@ -64,6 +64,7 @@ public class FlipperScript extends Script {
     private int actionsSinceIdle = 0;
     private long offerScreenStuckSince = 0L;
     private long currentStuckThreshold = 2000L;
+    private boolean awaitingModifyScreen = false; // true after clicking "Modify offer" on a sell abort
     private long breakWaitThreshold = 7000L; // 6-8s of continuous wait before allowing breaks
     private long lastGeOpenAttempt = 0L;
     private int geOpenAttempts = 0;
@@ -382,8 +383,9 @@ public class FlipperScript extends Script {
             // Check if copilot has other highlights on this sub-screen
             boolean hasHighlightsHere = this.getWidgetFromOverlay(this.highlightController, "") != null;
             if (hasHighlightsHere) {
-                this.status = "Offer screen: following copilot";
+                this.status = awaitingModifyScreen ? "Modify screen: following copilot" : "Offer screen: following copilot";
                 this.offerScreenStuckSince = 0L;
+                this.awaitingModifyScreen = false; // copilot responded, clear flag
                 // Fall through to checkAndClickHighlightedWidgets below
             } else {
                 // No highlights on sub-screen — check if copilot wants collect (happens on overview)
@@ -400,14 +402,17 @@ public class FlipperScript extends Script {
                 }
 
                 // No highlights, not collecting — start/check stuck timer
+                // Use longer timeout after "Modify offer" to give copilot time to highlight price widgets
+                long effectiveStuckThreshold = awaitingModifyScreen ? 8000L : currentStuckThreshold;
                 if (this.offerScreenStuckSince == 0L) {
                     this.offerScreenStuckSince = now;
-                    this.status = "Offer screen: waiting for copilot";
-                } else if (now - this.offerScreenStuckSince >= currentStuckThreshold) {
-                    log.info("Stuck on GE sub-screen for {}ms with no highlights, pressing back.",
-                            now - this.offerScreenStuckSince);
+                    this.status = awaitingModifyScreen ? "Modify screen: waiting for copilot" : "Offer screen: waiting for copilot";
+                } else if (now - this.offerScreenStuckSince >= effectiveStuckThreshold) {
+                    log.info("Stuck on GE sub-screen for {}ms with no highlights (modify={}), pressing back.",
+                            now - this.offerScreenStuckSince, awaitingModifyScreen);
                     this.status = "Returning to overview";
                     this.offerScreenStuckSince = 0L;
+                    this.awaitingModifyScreen = false;
                     Widget stuckBackBtn = Rs2Widget.getWidget(GE_BACK_BUTTON_WIDGET_ID);
                     preClickHover(stuckBackBtn);
                     Rs2GrandExchange.backToOverview();
@@ -418,6 +423,7 @@ public class FlipperScript extends Script {
             }
         } else {
             this.offerScreenStuckSince = 0L;
+            this.awaitingModifyScreen = false; // no longer on sub-screen
 
             // Detect sub-screen → overview transition: enforce a settling delay so copilot
             // can update its suggestions before we click on any stale highlights
@@ -1538,7 +1544,22 @@ public class FlipperScript extends Script {
             log.info("Found suggestion type '{}'.", suggestionType);
             Widget abortWidget = this.getWidgetFromOverlay(this.highlightController, suggestionType);
             if (abortWidget != null) {
-                this.status = "Aborting offer (right-click)";
+                // Determine if this is a sell offer — use "Modify offer" (faster) instead of "Abort offer"
+                boolean isSellOffer = false;
+                int widgetId = abortWidget.getId();
+                for (int i = 0; i < grandExchangeSlotIds.length; i++) {
+                    if (grandExchangeSlotIds[i] == widgetId) {
+                        GrandExchangeOffer[] offers = Microbot.getClient().getGrandExchangeOffers();
+                        if (offers != null && i < offers.length && offers[i] != null) {
+                            isSellOffer = offers[i].getState() == GrandExchangeOfferState.SELLING;
+                        }
+                        break;
+                    }
+                }
+                String menuOption = isSellOffer ? "Modify offer" : "Abort offer";
+                this.status = isSellOffer ? "Modifying sell offer (right-click)" : "Aborting offer (right-click)";
+                log.info("Slot widget {} → {} (isSell={})", widgetId, menuOption, isSellOffer);
+
                 boolean isAfterIdle = actionsSinceIdle == 0;
 
                 preClickHover(abortWidget);
@@ -1556,13 +1577,13 @@ public class FlipperScript extends Script {
                     return false;
                 }
 
-                // Short delay — experienced flipper knows where "Abort offer" is
+                // Short delay — experienced flipper knows where the option is
                 int menuReadDelay = Rs2Random.randomGaussian(220.0, 40.0);
                 FlipperScript.sleep(Math.max(150, Math.min(350, menuReadDelay)));
 
-                // Find "Abort offer" in the open menu and click it
-                if (!clickMenuOption("Abort offer")) {
-                    log.warn("Could not find 'Abort offer' in context menu");
+                // Click the chosen menu option
+                if (!clickMenuOption(menuOption)) {
+                    log.warn("Could not find '{}' in context menu", menuOption);
                     // Close menu by clicking elsewhere
                     Microbot.getMouse().click(new net.runelite.api.Point(10, 10), false);
                     FlipperScript.sleep(200, 400);
@@ -1573,6 +1594,7 @@ public class FlipperScript extends Script {
                 this.actionCount++;
                 long delay = getReactionDelay(actionsSinceIdle > 1, isAfterIdle);
                 this.actionCooldown = applyFittsLaw(delay, bounds);
+                this.awaitingModifyScreen = isSellOffer; // extend stuck timeout for modify flow
                 setPostClickGuard();
                 return true;
             }
@@ -1818,6 +1840,7 @@ public class FlipperScript extends Script {
         this.actionsSinceIdle = 0;
         this.offerScreenStuckSince = 0L;
         this.currentStuckThreshold = 2000L;
+        this.awaitingModifyScreen = false;
         this.breakWaitThreshold = 7000L;
         this.lastGeOpenAttempt = 0L;
         this.geOpenAttempts = 0;
